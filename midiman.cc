@@ -9,10 +9,14 @@
 #include <tinyalsa/asoundlib.h>
 #include <signal.h>
 #include <dirent.h>
+#include <assert.h>
+
+using namespace std;
 
 struct sample {
-  char *filename; 
-  std::vector<char *> frames;
+  string filename; 
+  unsigned int lastFrame;
+  vector<char *> frames;
 };
 
 struct ctx {
@@ -25,7 +29,7 @@ struct ctx {
 
 struct ctx ctx;
 static int close = 0;
-std::atomic_uchar tid;
+atomic_uchar tid;
 
 void stream_close(int sig)
 {
@@ -34,30 +38,63 @@ void stream_close(int sig)
     close = 1;
 }
 
-int play_sample(int index, unsigned char thread_id)
+// plays samples.  Interval determines the following
+// 1. Play From start 
+// 2. Play From left off position 
+// 3. Play From left off position - no advance 
+// 4. Play From left off position - no advance + write to file 
+// TODO: speed 
+// TODO: pop from history 
+int play_sample(int index, unsigned char thread_id, int interval)
 {
 
-    struct sample s = ctx.samples[index];
+    struct sample *s = &ctx.samples[index];
+    assert(s != NULL);
+
+
     unsigned int size = ctx.frameSize;
-    unsigned int nFrames = s.frames.size();
-    if (nFrames > 0){
-      for (unsigned int i=0; i<nFrames; i++){
+    unsigned int nFrames = s->frames.size();
+    unsigned int startFrame = 1;
+    if (interval != 1) {
+       startFrame = s->lastFrame;
+    }
+
+    // init output file
+    FILE *file = NULL;
+   if (interval == 4){
+      string outFilename = string("out/") + to_string(index) + "-" + to_string(startFrame);
+      file = fopen(outFilename.c_str(), "wb");
+   }
+
+    if (nFrames > 4){
+      // skipping beginning and ending frames to prevent popping
+      for (unsigned int i=startFrame; i<nFrames-2; i++){
         if (tid.load() != thread_id){
-        	break;
+	  // interrupted
+          return 0;
         }
-        int num_write = pcm_writei(ctx.pcm, (char *)s.frames.at(i),
+        int num_write = pcm_writei(ctx.pcm, (char *)s->frames.at(i),
 			pcm_bytes_to_frames(ctx.pcm, size));
 	if (num_write < 0){
                 fprintf(stderr, "error playing sample\n");
-         }
+         } else if (interval < 3) {
+            s->lastFrame = i;
+	 }
+	if (interval == 4){
+	  // w/o
+          if (fwrite((char *)s->frames.at(i), size, 1, file) == 0) {
+            fprintf(stderr,"Error capturing sample\n");
+            break;
+          }
+	}
       }
     }
-
+    s->lastFrame = 1;
     return 0;
 }
 
 
-void mycallback( double deltatime, std::vector< unsigned char > *message, void *userData )
+void mycallback( double deltatime, vector< unsigned char > *message, void *userData )
 {
   unsigned int nBytes = message->size();
   int offset = 24;
@@ -66,10 +103,10 @@ void mycallback( double deltatime, std::vector< unsigned char > *message, void *
     if (keyOn) {
       int note = (int)message->at(1);
       int sampleIndex = (note - offset) % ctx.nSamples;
+      int interval = (note - offset) / ctx.nSamples + 1;
       tid.store(tid.load()+1);
-      fprintf(stdout, "%d,", tid.load());
-      std::cout << "NOTE: "<<note <<" INDEX: "<<sampleIndex<< std::endl;
-      std::thread t1(play_sample, sampleIndex, tid.load());
+      cout << "NOTE: "<<note <<" INDEX: "<<sampleIndex<<" INTERVAL: "<<interval<< endl;
+      thread t1(play_sample, sampleIndex, tid.load(), interval);
       t1.detach();
     } else {
       // stop sample on key up
@@ -103,12 +140,12 @@ int ctx_init(struct ctx *ctx){
 }
 
 // load samples from path into memory
-int samples_init(struct ctx *ctx, std::string path){
+int samples_init(struct ctx *ctx, string path){
  
   DIR *dir;
   struct dirent *ent;
   dir = opendir(path.c_str());
-  std::vector<std::string> filenames;
+  vector<string> filenames;
 
   if (dir != NULL) {
     /* print all the files and directories within directory */
@@ -116,12 +153,11 @@ int samples_init(struct ctx *ctx, std::string path){
       ent = readdir(dir);
       if (ent != NULL){
 	char *fname = ent->d_name;
-	if (strstr(fname, ".wav") != NULL){
-	   std::string p(path);
+	//if (strstr(fname, ".wav") != NULL){
+	   string p(path);
 	   p.append(fname);
 	   filenames.push_back(p);
-    	   std::cout<<"READ: "<<p<<std::endl; 
-	}
+	//}
       }
     } while (ent != NULL);
 
@@ -138,9 +174,10 @@ int samples_init(struct ctx *ctx, std::string path){
   // load each sample file into memory 
   int bufsize = pcm_frames_to_bytes(ctx->pcm, pcm_get_buffer_size(ctx->pcm));
   for (unsigned int i=0; i<nFiles; i++){
-    FILE *file = fopen(((std::string)filenames.at(i)).c_str(), "rb");
+    FILE *file = fopen(((string)filenames.at(i)).c_str(), "rb");
+    cout<<i<<" - READ: "<<(string)filenames.at(i)<<endl; 
     if (file == NULL) {
-       fprintf(stderr, "failed to open file %s\n", ((std::string)filenames.at(i)).c_str());
+       fprintf(stderr, "failed to open file %s\n", ((string)filenames.at(i)).c_str());
        return -1;
     }
     unsigned int num_read;
@@ -151,6 +188,8 @@ int samples_init(struct ctx *ctx, std::string path){
             return -1;
         }
         num_read = fread(buffer, 1, bufsize, file);
+        ctx->samples[i].lastFrame = 1;
+        ctx->samples[i].filename = (string)filenames.at(i);
         ctx->samples[i].frames.push_back( buffer );
     } while (!close && num_read > 0);
   }
@@ -166,7 +205,9 @@ int main()
   if (ctx_init(&ctx) != 0){ 
       return -1;
   }
-  std::string path("/home/pi/Music/samples/coolsnap/");
+  //string path("/home/pi/Music/samples/drums/707fight/");
+  //string path("/home/pi/Music/recorder/recorder_5_02/0349/");
+  string path("/home/pi/mpc/out/");
   if (samples_init(&ctx, path) != 0){
       return -1;
   }
@@ -176,7 +217,7 @@ int main()
   // Check available ports.
   unsigned int nPorts = midiin->getPortCount();
   if ( nPorts == 0 ) {
-    std::cout << "No ports available!\n";
+    cout << "No ports available!\n";
     goto cleanup;
   }
   midiin->openPort( 0 );
@@ -186,9 +227,9 @@ int main()
   midiin->setCallback( &mycallback );
   // Don't ignore sysex, timing, or active sensing messages.
   midiin->ignoreTypes( false, false, false );
-  std::cout << "\nReading MIDI input ... press <enter> to quit.\n";
+  cout << "\nReading MIDI input ... press <enter> to quit.\n";
   char input;
-  std::cin.get(input);
+  cin.get(input);
   // Clean up
  cleanup:
   delete midiin;
